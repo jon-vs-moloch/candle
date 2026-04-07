@@ -296,6 +296,35 @@ function normalizeChatMessage(partial = {}) {
   };
 }
 
+function normalizePendingProactiveMessage(partial = {}) {
+  const text =
+    typeof partial === "string"
+      ? partial
+      : partial?.text ?? partial?.message ?? "";
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return null;
+
+  return {
+    id: typeof partial === "string" ? uid("pending") : String(partial.id || uid("pending")),
+    text: trimmed,
+    createdAt:
+      typeof partial === "string"
+        ? nowIso()
+        : String(partial.createdAt || nowIso()),
+    updatedAt:
+      typeof partial === "string"
+        ? nowIso()
+        : String(partial.updatedAt || partial.createdAt || nowIso()),
+    mergeCount: Number(
+      typeof partial === "string" ? 0 : partial.mergeCount ?? 0
+    ),
+    sourceTool:
+      typeof partial === "string"
+        ? "send_message_to_user"
+        : String(partial.sourceTool || "send_message_to_user")
+  };
+}
+
 function createInitialState() {
   const createdAt = nowIso();
   const productFrameId = uid("pkg");
@@ -474,8 +503,12 @@ function createInitialState() {
     },
     debug: {
       lastChatPrompt: "",
+      lastChatRequestTokens: 0,
+      lastChatManagedTokens: 0,
       lastChatResponse: "",
       lastBackgroundPrompt: "",
+      lastBackgroundRequestTokens: 0,
+      lastBackgroundManagedTokens: 0,
       lastBackgroundResponse: "",
       lastPersistedAt: null,
       lastEventAt: null
@@ -566,6 +599,8 @@ function normalizeState(rawState) {
     : [];
   next.background.pendingUserMessages = Array.isArray(next.background.pendingUserMessages)
     ? next.background.pendingUserMessages
+        .map((item) => normalizePendingProactiveMessage(item))
+        .filter(Boolean)
     : [];
   next.background.decisions = Array.isArray(next.background.decisions)
     ? next.background.decisions.slice(0, MAX_DECISIONS)
@@ -667,6 +702,14 @@ function buildDebugSnapshot(currentState) {
     activityHead: currentState.activity.slice(0, 16),
     debug: currentState.debug
   };
+}
+
+function getLastPromptTokenEstimate(currentState, mode = "background") {
+  const value =
+    mode === "background"
+      ? Number(currentState.debug?.lastBackgroundRequestTokens ?? 0)
+      : Number(currentState.debug?.lastChatRequestTokens ?? 0);
+  return Number.isFinite(value) ? value : 0;
 }
 
 function getSaveFeedbackLabel(key, fallback) {
@@ -1387,7 +1430,10 @@ function syncContextFromProcessedChat(currentState, processedUsers, assistantTex
     );
 
     currentState.background.pendingUserMessages = currentState.background.pendingUserMessages.filter(
-      (message) => !/preferred name|what would you like me to call you|what should i call you/i.test(String(message || ""))
+      (message) =>
+        !/preferred name|what would you like me to call you|what should i call you/i.test(
+          String(message?.text || message || "")
+        )
     );
   }
 
@@ -1488,6 +1534,111 @@ function formatStaleCarryoverForPrompt(currentState) {
     .join("\n\n");
 }
 
+function buildBackgroundOverheadPackages(currentState, recentChatMessages = []) {
+  const root = createContextPackage({
+    id: "pkg-prompt-overhead",
+    title: "Prompt overhead",
+    summary: "Prompt-only context carried alongside managed state in the background request.",
+    kind: "overhead",
+    priority: 0.52,
+    pinned: false,
+    readOnly: true,
+    lineageHue: 18,
+    turnsLeft: 6,
+    status: "active",
+    source: "overhead",
+    order: 12
+  });
+
+  const childSpecs = [
+    {
+      id: "pkg-overhead-shared-core",
+      title: "Shared prompt core",
+      text: buildSharedCorePrompt(currentState),
+      kind: "prompt",
+      order: 0
+    },
+    {
+      id: "pkg-overhead-background-prompt",
+      title: "Subconscious prompt",
+      text: String(currentState.config.backgroundPrompt || "").trim(),
+      kind: "prompt",
+      order: 1
+    },
+    {
+      id: "pkg-overhead-system-notices",
+      title: "System notices",
+      text: formatSystemNoticesForPrompt(currentState),
+      kind: "notice",
+      order: 2
+    },
+    {
+      id: "pkg-overhead-stale-carryover",
+      title: "Stale carryover",
+      text: formatStaleCarryoverForPrompt(currentState),
+      kind: "notice",
+      order: 3
+    },
+    {
+      id: "pkg-overhead-recent-decisions",
+      title: "Recent decisions summary",
+      text: currentState.background.decisions
+        .slice(0, 6)
+        .map((decision) => `- ${decision.tool} [${decision.kind}]: ${decision.reason}`)
+        .join("\n"),
+      kind: "summary",
+      order: 4
+    },
+    {
+      id: "pkg-overhead-raw-chat",
+      title: "Raw chat prompt copy",
+      text: formatRecentChatForPrompt(recentChatMessages, 260),
+      kind: "conversation",
+      order: 5
+    },
+    {
+      id: "pkg-overhead-turn-instruction",
+      title: "Turn instruction",
+      text: "Inspect the current maintained context and return the next single tool call as strict JSON.",
+      kind: "instruction",
+      order: 6
+    }
+  ];
+
+  const packages = [root];
+  childSpecs.forEach((spec, index) => {
+    const text = String(spec.text || "").trim();
+    if (!text) return;
+    packages.push(
+      createContextPackage({
+        id: spec.id,
+        title: spec.title,
+        summary: compactPromptText(text, 140),
+        contentDetails: text,
+        kind: spec.kind,
+        parentId: root.id,
+        priority: clamp(0.86 - index * 0.08, 0.14, 1),
+        pinned: false,
+        readOnly: true,
+        lineageHue: 18,
+        turnsLeft: clamp(8 - index, 1, 8),
+        status: "active",
+        source: "overhead",
+        order: spec.order
+      })
+    );
+  });
+
+  root.summary = `Prompt-only overhead with ${packages.length - 1} retained component${packages.length - 1 === 1 ? "" : "s"}.`;
+  root.content = packages
+    .slice(1)
+    .map((pkg) => `${pkg.title}: ~${estimatePackageTokens(pkg)} tok`)
+    .join("\n");
+
+  rebuildHierarchyRelations(packages);
+  return { root, packages };
+}
+
 function formatRecentChatForPrompt(input, maxCharsPerMessage = 420) {
   const messages = Array.isArray(input) ? input : getRecentChatWindow(input);
   return messages
@@ -1542,6 +1693,19 @@ function estimatePackageTokens(pkg) {
   const text = getPackageTextBlob(pkg);
   if (!text) return 0;
   return estimateTextTokens(text);
+}
+
+function estimatePackageSubtreeTokens(currentState, packageId) {
+  const packages = resolvePackageList(currentState);
+  const root = packages.find((pkg) => pkg.id === packageId);
+  if (!root) return 0;
+  let total = 0;
+  const visit = (pkg) => {
+    total += estimatePackageTokens(pkg);
+    getChildPackages(packages, pkg.id).forEach(visit);
+  };
+  visit(root);
+  return total;
 }
 
 function estimateMessageTokens(message) {
@@ -1910,17 +2074,23 @@ function buildBackgroundContextModel(currentState) {
     "background",
     conversationTree.meta.keptTokens || 0
   );
+  const overheadTree = buildBackgroundOverheadPackages(
+    currentState,
+    conversationTree.meta.messages
+  );
 
   const topLevelPackages = [
     ...durablePackages.filter((pkg) => !pkg.parentId),
     ...(conversationTree.root ? [conversationTree.root] : []),
-    ...(subconsciousTree.root ? [subconsciousTree.root] : [])
+    ...(subconsciousTree.root ? [subconsciousTree.root] : []),
+    ...(overheadTree.root ? [overheadTree.root] : [])
   ];
 
   const allPackages = [
     ...durablePackages,
     ...conversationTree.packages,
-    ...subconsciousTree.packages
+    ...subconsciousTree.packages,
+    ...overheadTree.packages
   ];
   rebuildHierarchyRelations(allPackages);
 
@@ -1928,6 +2098,7 @@ function buildBackgroundContextModel(currentState) {
     durablePackages,
     conversationTree,
     subconsciousTree,
+    overheadTree,
     topLevelPackages,
     allPackages
   };
@@ -1962,8 +2133,8 @@ function ensureContextSelection(contextPackages) {
   }
 }
 
-function getContextTileStyle(pkg, maxTokens) {
-  const tokens = estimatePackageTokens(pkg);
+function getContextTileStyle(pkg, maxTokens, packageList = null) {
+  const tokens = packageList ? estimatePackageSubtreeTokens(packageList, pkg.id) : estimatePackageTokens(pkg);
   const { cols, rows } = tileDimensionsForPackage(tokens, maxTokens);
   const hue = Number.isFinite(pkg.lineageHue) ? pkg.lineageHue : 204;
   const saturation = Math.round(28 + pkg.priority * 52);
@@ -2151,7 +2322,22 @@ function buildSharedCorePrompt(currentState) {
     .join("\n");
 }
 
-function buildChatSystemPrompt(currentState, activePackages) {
+function formatPendingProactiveDraftsForPrompt(currentState) {
+  const pending = currentState.background.pendingUserMessages
+    .map((item) => normalizePendingProactiveMessage(item))
+    .filter(Boolean);
+
+  if (!pending.length) return "- none";
+
+  return pending
+    .map((item) => {
+      const mergeNote = item.mergeCount ? ` | merged ${item.mergeCount}x` : "";
+      return `- ${compactPromptText(item.text, 220)}${mergeNote}`;
+    })
+    .join("\n");
+}
+
+function buildChatSystemPrompt(currentState, activePackages, pendingProactiveDrafts = []) {
   const totalTokens = activePackages.reduce((sum, pkg) => sum + estimatePackageTokens(pkg), 0);
   const { nextOut, atRisk } = getRiskBuckets(currentState);
   const conversationTree = buildConversationContextPackages(currentState, "chat", totalTokens, 1400);
@@ -2169,13 +2355,26 @@ function buildChatSystemPrompt(currentState, activePackages) {
   const subconsciousStructure = subconsciousTree.root
     ? summarizePackageTreeForPrompt(subconsciousTree.packages, subconsciousTree.root.id, 0, 12).join("\n")
     : "- none";
+  const pendingDraftsBlock = pendingProactiveDrafts.length
+    ? pendingProactiveDrafts
+        .map((item) => {
+          const draft = normalizePendingProactiveMessage(item);
+          if (!draft) return null;
+          const mergeNote = draft.mergeCount ? ` | merged ${draft.mergeCount}x` : "";
+          return `- ${compactPromptText(draft.text, 220)}${mergeNote}`;
+        })
+        .filter(Boolean)
+        .join("\n")
+    : "- none";
   const sections = [
     buildSharedCorePrompt(currentState),
     String(currentState.config.chatPrompt || "").trim(),
+    "Pending proactive drafts are assistant-side thoughts that have not yet been surfaced. If one naturally belongs in the current reply, weave its substance into the reply and treat it as consumed instead of producing a separate extra assistant turn later.",
     `Approximate managed context tokens: ${totalTokens} of ${managedBudget}.`,
     "__TOTAL_REQUEST_PLACEHOLDER__",
     `Recent system notices:\n${systemNotices || "- none"}`,
     `Stale background carryover:\n${staleCarryover || "- none"}`,
+    `Pending proactive drafts:\n${pendingDraftsBlock}`,
     `Maintained context packages:\n${activePackages.map(summarizePackageForPrompt).join("\n") || "- none"}`,
     `Recent conversation structure:\n${conversationStructure}`,
     `Recent raw chat retention:\n- keeping ${recentChatWindow.length} processed message${recentChatWindow.length === 1 ? "" : "s"} (~${recentChatMeta.keptTokens} tok)\n- older processed chat outside this retained window: ${recentChatMeta.omittedCount} message${recentChatMeta.omittedCount === 1 ? "" : "s"} (~${recentChatMeta.omittedTokens} tok)\n- likely to age out next: ${recentChatMeta.omittedPreview.join(" | ") || "none"}`,
@@ -2192,6 +2391,8 @@ function buildChatSystemPrompt(currentState, activePackages) {
     "__TOTAL_REQUEST_PLACEHOLDER__",
     `Approximate total request tokens: ${estimatedRequestTokens} of ${TOTAL_REQUEST_BUDGET_TOKENS}.`
   );
+  currentState.debug.lastChatRequestTokens = estimatedRequestTokens;
+  currentState.debug.lastChatManagedTokens = totalTokens;
   return prompt;
 }
 
@@ -2263,6 +2464,8 @@ function buildInnerLoopPrompt(currentState, activePackages, feedbackTrail = []) 
     "__TOTAL_REQUEST_PLACEHOLDER__",
     `Approximate total request tokens: ${estimatedRequestTokens} of ${TOTAL_REQUEST_BUDGET_TOKENS}.`
   );
+  currentState.debug.lastBackgroundRequestTokens = estimatedRequestTokens;
+  currentState.debug.lastBackgroundManagedTokens = totalTokens;
   return prompt;
 }
 
@@ -2335,15 +2538,96 @@ async function callModelWithMessages(currentState, messages, temperature = 0.7) 
   return text;
 }
 
-function dedupeQueuedUserMessage(currentState, message) {
-  const trimmed = String(message || "").trim();
-  if (!trimmed) return false;
+function getPendingProactiveText(item) {
+  return String(item?.text || item || "").trim();
+}
 
-  const queuedTexts = currentState.background.pendingUserMessages.map((item) =>
-    item.trim().toLowerCase()
+function tokenizeForMessageSimilarity(text) {
+  return normalizeComparisonText(text)
+    .split(" ")
+    .filter((token) => token.length > 2);
+}
+
+function getMessageSimilarity(a, b) {
+  const aNorm = normalizeComparisonText(a);
+  const bNorm = normalizeComparisonText(b);
+  if (!aNorm || !bNorm) return 0;
+  if (aNorm === bNorm) return 1;
+
+  const aTokens = new Set(tokenizeForMessageSimilarity(a));
+  const bTokens = new Set(tokenizeForMessageSimilarity(b));
+  if (!aTokens.size || !bTokens.size) return 0;
+
+  let intersection = 0;
+  aTokens.forEach((token) => {
+    if (bTokens.has(token)) intersection += 1;
+  });
+
+  return intersection / Math.max(aTokens.size, bTokens.size);
+}
+
+function mergePendingProactiveMessage(existing, incoming) {
+  const existingText = getPendingProactiveText(existing);
+  const incomingText = String(incoming || "").trim();
+  if (!existingText) {
+    return normalizePendingProactiveMessage(incomingText);
+  }
+  if (!incomingText) {
+    return normalizePendingProactiveMessage(existingText);
+  }
+
+  const similarity = getMessageSimilarity(existingText, incomingText);
+  const preferIncoming =
+    incomingText.length <= existingText.length + 32 ||
+    similarity < 0.92;
+
+  return {
+    ...existing,
+    text: preferIncoming ? incomingText : existingText,
+    updatedAt: nowIso(),
+    mergeCount: Number(existing?.mergeCount ?? 0) + 1
+  };
+}
+
+function queueOrMergePendingUserMessage(currentState, message) {
+  const normalized = normalizePendingProactiveMessage(message);
+  if (!normalized) {
+    return { changed: false, status: "invalid" };
+  }
+
+  const exactIndex = currentState.background.pendingUserMessages.findIndex(
+    (item) => normalizeComparisonText(getPendingProactiveText(item)) === normalizeComparisonText(normalized.text)
   );
+  if (exactIndex !== -1) {
+    currentState.background.pendingUserMessages[exactIndex] = mergePendingProactiveMessage(
+      currentState.background.pendingUserMessages[exactIndex],
+      normalized.text
+    );
+    return {
+      changed: false,
+      status: "duplicate",
+      message: currentState.background.pendingUserMessages[exactIndex]
+    };
+  }
 
-  return queuedTexts.includes(trimmed.toLowerCase());
+  const similarIndex = currentState.background.pendingUserMessages.findIndex(
+    (item) => getMessageSimilarity(getPendingProactiveText(item), normalized.text) >= 0.72
+  );
+  if (similarIndex !== -1) {
+    currentState.background.pendingUserMessages[similarIndex] = mergePendingProactiveMessage(
+      currentState.background.pendingUserMessages[similarIndex],
+      normalized.text
+    );
+    return {
+      changed: true,
+      status: "merged",
+      message: currentState.background.pendingUserMessages[similarIndex]
+    };
+  }
+
+  currentState.background.pendingUserMessages.push(normalized);
+  currentState.background.pendingUserMessages = currentState.background.pendingUserMessages.slice(-4);
+  return { changed: true, status: "queued", message: normalized };
 }
 
 function extractUserMessageFromToolCall(toolCall, args) {
@@ -3014,23 +3298,33 @@ function executeToolCall(currentState, toolCall) {
 
     case "send_message_to_user": {
       const message = extractUserMessageFromToolCall(toolCall, args);
-      if (!message || dedupeQueuedUserMessage(currentState, message)) {
-        return toolError(tool, reason, args, "Message was empty or already queued.", "noop_message");
+      const queued = queueOrMergePendingUserMessage(currentState, message);
+      if (queued.status === "invalid") {
+        return toolError(tool, reason, args, "Message was empty.", "noop_message");
       }
 
-      currentState.background.pendingUserMessages.push(message);
-      currentState.background.pendingUserMessages = currentState.background.pendingUserMessages.slice(-4);
       enqueueDebugEvent({
-        type: "user_message_queued",
+        type:
+          queued.status === "merged"
+            ? "user_message_merged"
+            : queued.status === "duplicate"
+              ? "user_message_duplicate_pending"
+              : "user_message_queued",
         tool,
         reason,
-        message
+        message: queued.message?.text || message
       });
       return {
-        changed: true,
+        changed: queued.changed,
         tool,
         reason,
-        summary: modelSummary || "Queued a proactive user-facing message.",
+        summary:
+          modelSummary ||
+          (queued.status === "merged"
+            ? "Merged with an existing pending proactive message."
+            : queued.status === "duplicate"
+              ? "Equivalent proactive message was already pending."
+              : "Queued a proactive user-facing message."),
         diff: "",
         args
       };
@@ -3054,11 +3348,13 @@ function flushPendingUserMessages(currentState) {
   currentState.background.pendingUserMessages = [];
 
   pending.forEach((message) => {
-    addChatMessage(currentState, "assistant", message, "proactive");
-    maybeIngestChatIntoContext(currentState, "assistant", message);
+    const text = getPendingProactiveText(message);
+    addChatMessage(currentState, "assistant", text, "proactive");
+    maybeIngestChatIntoContext(currentState, "assistant", text);
     enqueueDebugEvent({
       type: "user_message_surfaced",
-      message
+      message: text,
+      mergeCount: Number(message?.mergeCount ?? 0)
     });
   });
 
@@ -3284,7 +3580,10 @@ function buildChatMessagesForModel(currentState, pendingUserMessages) {
     activePackages.map((pkg) => pkg.id)
   );
 
-  const systemPrompt = buildChatSystemPrompt(currentState, activePackages);
+  const pendingProactiveDrafts = currentState.background.pendingUserMessages
+    .map((item) => normalizePendingProactiveMessage(item))
+    .filter(Boolean);
+  const systemPrompt = buildChatSystemPrompt(currentState, activePackages, pendingProactiveDrafts);
   currentState.debug.lastChatPrompt = systemPrompt;
 
   const recentChat = getRecentChatWindow(currentState)
@@ -3303,6 +3602,40 @@ function buildChatMessagesForModel(currentState, pendingUserMessages) {
     ...recentChat,
     ...queuedUsers
   ];
+}
+
+function consumePendingProactiveDraftsAfterChat(currentState, assistantText) {
+  const pending = currentState.background.pendingUserMessages
+    .map((item) => normalizePendingProactiveMessage(item))
+    .filter(Boolean);
+  if (!pending.length) return [];
+
+  const consumed = pending.filter((item) => {
+    const similarity = getMessageSimilarity(item.text, assistantText);
+    return similarity >= 0.28 || assistantText.length > 0;
+  });
+
+  currentState.background.pendingUserMessages = [];
+
+  if (consumed.length) {
+    enqueueDebugEvent({
+      type: "pending_proactive_consumed_by_chat",
+      consumed: consumed.map((item) => ({
+        id: item.id,
+        text: item.text,
+        mergeCount: item.mergeCount
+      })),
+      assistantText
+    });
+    pushActivity(
+      currentState,
+      "Consumed pending proactive drafts",
+      `Folded ${consumed.length} pending proactive draft${consumed.length === 1 ? "" : "s"} into the latest chat turn.`,
+      "chat"
+    );
+  }
+
+  return consumed;
 }
 
 let chatTurnInFlight = false;
@@ -3330,6 +3663,7 @@ async function pumpChatQueue() {
         processed: true,
         processedAt
       });
+      consumePendingProactiveDraftsAfterChat(state, responseText);
       state.processedConversationRevision += 1;
       syncContextFromProcessedChat(state, pendingUsers, responseText);
       pushActivity(
@@ -3522,11 +3856,18 @@ function renderBackgroundPanel() {
   const mapPackages = contextModel.topLevelPackages;
   const decisions = state.background.decisions.slice(0, 14);
   const liveDecision = state.background.liveDecision;
-  const totalContextTokens = mapPackages.reduce(
+  const mapContextTokens = mapPackages.reduce(
+    (sum, pkg) => sum + estimatePackageSubtreeTokens(contextPackages, pkg.id),
+    0
+  );
+  const fullManagedTokens = contextPackages.reduce(
     (sum, pkg) => sum + estimatePackageTokens(pkg),
     0
   );
   const managedBudget = getManagedContextBudgetTokens(state);
+  const lastBackgroundRequestTokens = getLastPromptTokenEstimate(state, "background");
+  const lastChatRequestTokens = getLastPromptTokenEstimate(state, "chat");
+  const backgroundOverheadTokens = Math.max(0, lastBackgroundRequestTokens - fullManagedTokens);
   ensureContextSelection(contextPackages);
   const selectedPackages = contextPackages.filter((pkg) =>
     uiState.selectedContextIds.includes(pkg.id)
@@ -3608,7 +3949,7 @@ function renderBackgroundPanel() {
       <div class="section compact-section context-section">
         <div class="section-title">
           <h3>Context</h3>
-          <span class="tiny">${contextPackages.length} · ~${totalContextTokens}/${managedBudget} managed tok</span>
+          <span class="tiny">${contextPackages.length} · map ~${mapContextTokens}/${managedBudget} · full ~${fullManagedTokens}/${managedBudget} managed · bg req ~${lastBackgroundRequestTokens}/${TOTAL_REQUEST_BUDGET_TOKENS} · non-managed ~${backgroundOverheadTokens} · chat req ~${lastChatRequestTokens}/${TOTAL_REQUEST_BUDGET_TOKENS}</span>
         </div>
         <div class="context-section-body">
           <div class="context-list context-map">
@@ -3617,7 +3958,7 @@ function renderBackgroundPanel() {
                 ? mapPackages
                     .map(
                       (pkg) => {
-                        const tile = getContextTileStyle(pkg, managedBudget);
+                        const tile = getContextTileStyle(pkg, managedBudget, contextPackages);
                         const selected = uiState.selectedContextIds.includes(pkg.id);
 
                         return `
